@@ -1,5 +1,5 @@
 import numpy as np
-import matplotlib as plt
+import matplotlib.pyplot as plt
 def parafac2_admm_em(X_list_in, W_list, rank, max_iter=500, tol=1e-7, noise_type='sparse',
                      prox_gA=prox_nonnegative_normalize,
                      prox_gB=prox_normalize,
