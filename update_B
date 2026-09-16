@@ -1,70 +1,42 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": 1,
-   "id": "dea24a00",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "def update_B_mode(X_list, A, D_vecs, B_list, ZB_list, YB_list, muZB_list, muDeltaB_list, P_list, Delta_B, rho_B,prox_gB):\n",
-    "    K = len(X_list)\n",
-    "    R = A.shape[1]\n",
-    "\n",
-    "    for k in range(K):\n",
-    "        D_k = np.diag(D_vecs[k])\n",
-    "\n",
-    "        rhs = X_list[k].T @ A @ D_k + 0.5 * rho_B[k] * (ZB_list[k] - muZB_list[k] + YB_list[k] - muDeltaB_list[k])\n",
-    "        lhs = D_k @ A.T @ A @ D_k + rho_B[k] * np.eye(R)\n",
-    "\n",
-    "        # B_k = RHS * inv(LHS)\n",
-    "        B_list[k] = np.linalg.solve(lhs.T, rhs.T).T\n",
-    "\n",
-    "    for k in range(K):\n",
-    "        ZB_list[k] = prox_gB(B_list[k] + muZB_list[k], scale=1.0 / rho_B[k])\n",
-    "\n",
-    "    for k in range(K):\n",
-    "        M = (B_list[k] + muDeltaB_list[k]) @ Delta_B.T\n",
-    "        U,_,Vt = np.linalg.svd(M,full_matrices=False)\n",
-    "        P_list[k] = U @ Vt\n",
-    "\n",
-    "    sigma_rho = np.sum(rho_B)\n",
-    "    weighted_proj_sum = sum(\n",
-    "        rho_B[k] * (P_list[k].T @ (B_list[k] + muDeltaB_list[k]))\n",
-    "        for k in range(K)                    \n",
-    "    )\n",
-    "    Delta_B = weighted_proj_sum / sigma_rho\n",
-    "\n",
-    "    for k in range(K):\n",
-    "        YB_list[k] = P_list[k] @ Delta_B\n",
-    "\n",
-    "    for k in range(K):\n",
-    "        muZB_list[k] += B_list[k] - ZB_list[k]\n",
-    "        muDeltaB_list[k] += B_list[k] - YB_list[k]\n",
-    "\n",
-    "    return B_list, ZB_list, YB_list, muZB_list, muDeltaB_list, P_list,Delta_B"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "retfound",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.11.0"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+import numpy as np
+def update_B_mode(X_list, A, D_vecs, B_list, ZB_list, YB_list, muZB_list, muDeltaB_list, P_list, Delta_B, rho_B,prox_gB, max_iter=50, tol=1e-6):
+    K = len(X_list)
+    R = A.shape[1]
+
+    for it in range(max_iter):
+     for k in range(K):
+        D_k = np.diag(D_vecs[k])
+
+        rhs = X_list[k].T @ A @ D_k + 0.5 * rho_B[k] * (ZB_list[k] - muZB_list[k] + YB_list[k] - muDeltaB_list[k])
+        lhs = D_k @ A.T @ A @ D_k + rho_B[k] * np.eye(R)
+
+        # B_k = RHS * inv(LHS)
+        B_list[k] = np.linalg.solve(lhs.T, rhs.T).T
+
+     for k in range(K):
+        ZB_list[k] = prox_gB(B_list[k] + muZB_list[k], scale=1.0 / rho_B[k])
+
+     for k in range(K):
+        M = (B_list[k] + muDeltaB_list[k]) @ Delta_B.T
+        U,_,Vt = np.linalg.svd(M,full_matrices=False)
+        P_list[k] = U @ Vt
+
+     sigma_rho = np.sum(rho_B)
+     weighted_proj_sum = sum(
+        rho_B[k] * (P_list[k].T @ (B_list[k] + muDeltaB_list[k]))
+        for k in range(K)                    
+     )
+     Delta_B = weighted_proj_sum / sigma_rho
+
+     for k in range(K):
+        YB_list[k] = P_list[k] @ Delta_B
+
+     for k in range(K):
+        muZB_list[k] += B_list[k] - ZB_list[k]
+        muDeltaB_list[k] += B_list[k] - YB_list[k]
+
+     res_norm = sum(np.linalg.norm(B_list[k] - YB_list[k], 'fro') for k in range(K))
+     if res_norm < tol:
+        break
+
+    return B_list, ZB_list, YB_list, muZB_list, muDeltaB_list, P_list,Delta_B
