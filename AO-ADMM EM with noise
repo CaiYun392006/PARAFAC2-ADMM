@@ -1,0 +1,148 @@
+def parafac2_admm_em(X_list, W_list, rank, max_iter=500, tol=1e-5,
+                     prox_gA=lambda x, scale: x,
+                     prox_gB=lambda x, scale: x,
+                     prox_gD=lambda x, scale: x):
+    
+    K = len(X_list)
+    I = X_list[0].shape[0]
+    J_list = [X_k.shape[1] for X_k in X_list]
+    R = rank
+
+    if len(W_list) != K:
+        raise ValueError("W_list must have the same number of slices as X_list.")
+
+    for k in range(K):
+        if W_list[k].shape != X_list[k].shape:
+            raise ValueError(f"W_list[{k}] must have the same shape as X_list[{k}].")
+        if not np.all((W_list[k] == 0) | (W_list[k] == 1)):
+            raise ValueError(f"W_list[{k}] must be a binary mask consisting of 0 and 1.")
+
+    
+    A = np.abs(np.random.randn(I, R))
+    B_list = [np.abs(np.random.randn(J_list[k], R)) for k in range(K)]
+    D_vecs = [np.abs(np.random.randn(R)) for k in range(K)]
+
+    # Auxiliary and dual variables for A
+    Z_A = A.copy()
+    mu_A = np.zeros_like(A)
+
+    # Auxiliary and dual variables for B
+    ZB_list = [B.copy() for B in B_list]
+    YB_list = [B.copy() for B in B_list]
+
+    muZB_list = [np.zeros_like(B) for B in B_list]
+    muDeltaB_list = [np.zeros_like(B) for B in B_list]
+
+    # Auxiliary and dual variables for Delta_B
+    P_list = [np.eye(J_list[k], R) for k in range(K)]
+    Delta_B = np.eye(R)
+
+    # Auxiliary and dual variables for D
+    Z_D_list = [d.copy() for d in D_vecs]
+    mu_D_list = [np.zeros_like(d) for d in D_vecs]
+
+   
+
+    X_imputed = []
+    for k in range(K):
+        X_k = np.array(X_list[k], dtype=float, copy=True)
+        mean_val = np.nanmean(X_k)
+        X_k[W_list[k]==0] = mean_val
+        X_imputed.append(X_k)
+
+    
+    norm_X_observed_sq = sum(
+        np.linalg.norm(X_list[k][W_list[k] == 1])**2
+        for k in range(K)
+    )
+    if norm_X_observed_sq == 0:
+        norm_X_observed_sq = 1.0
+
+    sse_list = []
+    em_imputation_error_list = []
+    prev_sse = None
+
+
+    for it in range(max_iter):
+        rho_A, rho_B, rho_D = update_rho(A, B_list, D_vecs, Delta_B)
+
+        B_list, ZB_list, YB_list, muZB_list, muDeltaB_list, P_list, Delta_B = update_B_mode(
+            X_imputed,
+            A,
+            D_vecs,
+            B_list,
+            ZB_list,
+            YB_list,
+            muZB_list,
+            muDeltaB_list,
+            P_list,
+            Delta_B,
+            rho_B,
+            prox_gB
+        )
+
+        A, Z_A, mu_A = update_A_mode(
+            X_imputed,
+            B_list,
+            D_vecs,
+            Z_A,
+            mu_A,
+            rho_A,
+            prox_gA
+        )
+
+        D_vecs, Z_D_list, mu_D_list = update_D_mode(
+            X_imputed,
+            A,
+            B_list,
+            D_vecs,
+            Z_D_list,
+            mu_D_list,
+            rho_D,
+            prox_gD
+        )
+
+        X_reconstructed = [
+            A @ np.diag(D_vecs[k]) @ B_list[k].T
+            for k in range(K)
+        ]
+
+        previous_imputed = [X_k.copy() for X_k in X_imputed]
+
+        for k in range(K):
+            missing_mask = (W_list[k] == 0)
+            X_imputed[k][missing_mask] = X_reconstructed[k][missing_mask]
+
+        sse = sum(
+            np.linalg.norm(
+                (X_list[k] - X_reconstructed[k])[W_list[k] == 1]
+            )**2
+            for k in range(K)
+        )
+
+        rel_sse = sse / norm_X_observed_sq
+        sse_list.append(rel_sse)
+
+        em_imputation_error = sum(
+            np.linalg.norm(
+                (X_imputed[k] - previous_imputed[k])[W_list[k] == 0]
+            )**2
+            for k in range(K)
+        )
+        em_imputation_error_list.append(em_imputation_error)
+
+        if prev_sse is not None:
+            rel_change = abs(prev_sse - sse) / max(abs(prev_sse), 1e-12)
+
+            if (it + 1) % 10 == 0 or it == 0:
+                print(f"Iter {it+1:3d}/{max_iter} , relative SSE observed: {rel_sse:.6e}")
+
+            if rel_change < tol:
+                print(f"\nAO-ADMM (EM) converged at iteration {it+1}")
+                break
+        else:
+            print(f"Iter {it+1:3d}/{max_iter} , relative SSE observed: {rel_sse:.6e}")
+
+        prev_sse = sse
+
+    return A, B_list, D_vecs, sse_list, X_imputed, X_reconstructed, W_list, em_imputation_error_list
