@@ -1,0 +1,227 @@
+import numpy as np
+import matplotlib as plt
+def parafac2_admm_em(X_list_in, W_list, rank, max_iter=500, tol=1e-7, noise_type='sparse',
+                     prox_gA=prox_nonnegative_normalize,
+                     prox_gB=prox_normalize,
+                     prox_gD=prox_normalize):
+ 
+    K = len(X_list_in)
+    I = X_list_in[0].shape[0]
+    J_list = [X_k.shape[1] for X_k in X_list_in]
+    R = rank
+
+    # Initialize factor matrices
+    A = np.abs(np.random.randn(I, R))
+    B_list = [np.abs(np.random.randn(J_list[k], R)) for k in range(K)]
+    D_vecs = [np.abs(np.random.randn(R)) for k in range(K)]
+
+   
+    ZB_list = [B.copy() for B in B_list]
+    YB_list = [B.copy() for B in B_list]
+    muZB_list = [np.zeros_like(B) for B in B_list]
+    muDeltaB_list = [np.zeros_like(B) for B in B_list]
+    P_list = [np.eye(J_list[k], R) for k in range(K)]
+    Delta_B = np.eye(R)
+
+    # Normalize input data
+    norm_X = np.sqrt(sum(np.linalg.norm(X_k, 'fro')**2 for X_k in X_list_in))
+    X_imputed = [X_k.copy() / norm_X for X_k in X_list_in]
+    for k in range(K):
+        X_imputed[k][W_list[k] == 0] = 0.0 # Mark unobserved data equals to 0
+
+    # Initialize noise matrix E_k
+    E_list = [np.zeros_like(X_k) for X_k in X_list_in]
+
+    sse_list = []
+    func_rel_missing_list = []
+    outlier_sparsity_list = []
+
+    for it in range(max_iter):
+        X_imputed_prev = [X_k.copy() for X_k in X_imputed]
+        X_clean = [X_imputed[k] - E_list[k] for k in range(K)]
+
+        rho_A, rho_B_list, rho_D_list = update_rho(A, B_list, D_vecs)
+        rhs_A = np.zeros((I, R))
+        lhs_A = np.zeros((R, R))
+        for k in range(K):
+            gram_k = B_list[k] * D_vecs[k]
+            rhs_A += X_clean[k] @ gram_k
+            lhs_A += gram_k.T @ gram_k
+
+        lhs_A += 1e-6 * np.eye(R)
+        A = np.linalg.solve(lhs_A.T, rhs_A.T).T
+        A = prox_gA(A)
+
+        
+      
+        for k in range(K):
+            rho_B_k = rho_B_list[k]
+            D_k = np.diag(D_vecs[k])
+            X_clean_k = X_imputed[k] - E_list[k]
+            rhs = X_clean_k.T @ A @ D_k + 0.5 * rho_B_k * (
+                ZB_list[k] - muZB_list[k] + YB_list[k] - muDeltaB_list[k]
+            )
+            lhs = D_k @ A.T @ A @ D_k + rho_B_k * np.eye(R)
+            B_list[k] = np.linalg.solve(lhs.T, rhs.T).T
+
+            ZB_list[k] = prox_gB(B_list[k] + muZB_list[k], scale=1.0 / rho_B_k)
+
+            M = (B_list[k] + muDeltaB_list[k]) @ Delta_B.T
+            U, _, Vt = np.linalg.svd(M, full_matrices=False)
+            P_list[k] = U @ Vt
+
+        weighted_proj_sum = sum(P_list[k].T @ (B_list[k] + muDeltaB_list[k]) for k in range(K))
+        Delta_B = weighted_proj_sum / K
+
+        for k in range(K):
+            YB_list[k] = P_list[k] @ Delta_B
+            muZB_list[k] += B_list[k] - ZB_list[k]
+            muDeltaB_list[k] += B_list[k] - YB_list[k]
+
+        for k in range(K):
+            X_clean_k = X_imputed[k] - E_list[k]
+            rhs = np.diag(A.T @ X_clean_k @ B_list[k])
+            lhs = (A.T @ A) * (B_list[k].T @ B_list[k]) + 1e-6 * np.eye(R)
+            D_vecs[k] = np.linalg.solve(lhs, rhs)
+            D_vecs[k] = prox_gD(D_vecs[k])
+
+        # E-Step: Reconstruct, Update outliers (E_k) and Impute missing entries
+        X_reconstructed = [A @ np.diag(D_vecs[k]) @ B_list[k].T for k in range(K)]
+
+        # Soft-thresholding for Outlier E_k at observed entries W_k = 1
+        for k in range(K):
+            residual_k = X_imputed[k] - X_reconstructed[k]
+            lambda_E_dyn = compute_lambda_E(residual_k, W_list[k])
+            if noise_type == 'group':
+                E_list[k] = prox_group_lasso(residual_k, scale=lambda_E_dyn, axis=0)
+            else:
+                E_list[k] = prox_sparse(residual_k, scale=lambda_E_dyn / 2.0)
+                
+            E_list[k][W_list[k] == 0] = 0.0  
+
+        # Impute missing data (W_k = 0)
+        for k in range(K):
+            missing_mask = (W_list[k] == 0)
+            X_imputed[k][missing_mask] = X_reconstructed[k][missing_mask]
+
+        diff_missing = sum(np.linalg.norm((X_imputed[k] - X_imputed_prev[k])[W_list[k] == 0])**2 for k in range(K))
+        func_rel_missing_list.append(np.sqrt(diff_missing))
+
+        sse_observed = sum(np.linalg.norm((X_list_in[k] / norm_X - X_reconstructed[k] - E_list[k])[W_list[k] == 1])**2 for k in range(K))
+        sse_list.append(sse_observed)
+
+        total_nonzero = sum(np.count_nonzero(np.abs(E_list[k]) > 1e-8) for k in range(K))
+        total_entries = sum(np.sum(W_list[k] == 1) for k in range(K))
+        outlier_sparsity_list.append(total_nonzero / max(total_entries, 1))
+
+        if it > 1 and abs(sse_list[-2] - sse_list[-1]) < tol:
+            print(f"Algorithm Converged at iteration {it + 1}")
+            break
+
+    return A, B_list, D_vecs, E_list, norm_X, X_reconstructed, sse_list, func_rel_missing_list, outlier_sparsity_list
+
+
+if __name__ == "__main__":
+    np.random.seed(42)
+
+    K = 5
+    I = 20
+    J_list = [30, 35, 25, 40, 28]
+    R = 3
+    miss_frac = 0.50
+    outlier_frac = 0.50
+    outlier_magnitude = 10.0
+
+    
+    A_true = np.abs(np.random.randn(I, R))
+    Delta_true = np.abs(np.random.randn(R, R))
+    B_true = []
+    for k in range(K):
+        Q, _ = np.linalg.qr(np.random.randn(J_list[k], R))
+        B_true.append(Q @ Delta_true)
+    D_true = [np.random.uniform(0.5, 1.5, R) for k in range(K)]
+
+    # Missing mask W (1: observed, 0: unobserved)
+    W_list = [(np.random.rand(I, J_list[k]) > miss_frac).astype(int) for k in range(K)]
+
+    # Generate outliers E_true at observed data (W_k = 1)
+    E_true = []
+    for k in range(K):
+        E_k = np.zeros((I, J_list[k]))
+        stripe_cols = np.random.choice(J_list[k], size=int(J_list[k] * 0.1),replace=False)
+        E_k[:, stripe_cols] = outlier_magnitude * np.random.randn(I, len(stripe_cols))
+        E_k[W_list[k] == 0] = 0.0
+        E_true.append(E_k)
+
+    X_clean_true = [A_true @ np.diag(D_true[k]) @ B_true[k].T for k in range(K)]
+
+    sigma_list = [0.0, 0.0001, 0.01, 0.1]
+    base_noise = [np.random.randn(I, J_list[k]) for k in range(K)]
+    results = {}
+
+    for sigma in sigma_list:
+        X_full = [X_clean_true[k] + sigma * base_noise[k] + E_true[k] for k in range(K)]
+
+        A_est, B_est, D_est, E_est, norm_X, X_recon, sse_list, rel_miss, outlier_sp = parafac2_admm_em(
+            X_full, W_list, rank=R, max_iter=700, noise_type='group'
+        )
+        
+        true_miss_vec = np.concatenate([(X_clean_true[k] / norm_X)[W_list[k] == 0] for k in range(K)])
+        fit_miss_vec = np.concatenate([X_recon[k][W_list[k] == 0] for k in range(K)])
+        r_val = np.corrcoef(true_miss_vec, fit_miss_vec)[0, 1] if np.std(true_miss_vec) > 1e-12 else 0.0
+
+        results[sigma] = {
+            'sse_list': sse_list,
+            'true_miss': true_miss_vec,
+            'fit_miss': fit_miss_vec,
+            'r_val': r_val
+        }
+        print("\nMatrix A (Ground truth vs Estimation):")
+        print("A_true:\n", A_true)
+        print("A_est:\n", A_est)
+
+        # Compare matrix D
+        for k in range(K):
+         print(f"\nD vector for slice {k} (Ground truth vs Estimation):")
+         print("D_true:\n", D_true[k])
+         print("D_est:\n", D_est[k])
+
+        # Compare matrix B
+        for k in range(K):
+         print(f"\nMatrix B for slice {k} (Ground truth vs Estimation):")
+         print("B_true:\n", B_true[k])
+         print("B_est:\n", B_est[k])
+         
+    plt.figure(figsize=(9, 5))
+    for sigma in sigma_list:
+        plt.plot(results[sigma]['sse_list'], label=f'Gaussian noise $\sigma = {sigma}$')
+    plt.title('AO-ADMM EM SSE Convergence Curve with Outliers', fontsize=12, fontweight='bold')
+    plt.xlabel('Iteration', fontsize=10)
+    plt.ylabel('Observed Objective SSE', fontsize=10)
+    plt.yscale('log')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend(fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+    fig, axes = plt.subplots(1, len(sigma_list), figsize=(4 * len(sigma_list), 4))
+    for i, sigma in enumerate(sigma_list):
+      ax = axes[i]
+      t_vec = results[sigma]['true_miss']
+      f_vec = results[sigma]['fit_miss']
+      r_val = results[sigma]['r_val']
+
+      ax.scatter(t_vec, f_vec, s=12, alpha=0.5, color='green')
+      lims = [min(t_vec.min(), f_vec.min()), max(t_vec.max(), f_vec.max())]
+      ax.plot(lims, lims, 'r--', lw=1.5, label='Ideal line')
+
+      ax.set_title(f'$\sigma = {sigma}$ (r = {r_val:.3f})', fontsize=11, fontweight='bold')
+      ax.set_xlabel('True Value', fontsize=9)
+      if i == 0:
+        ax.set_ylabel('Imputed Value', fontsize=9)
+      ax.grid(True, linestyle=':', alpha=0.7)
+      ax.legend(loc='upper left', fontsize=8)
+
+    plt.suptitle('Imputed vs True Values for Missing Entries (W = 0)', fontsize=13, fontweight='bold', y=1.03)
+    plt.tight_layout()
+    plt.show()
